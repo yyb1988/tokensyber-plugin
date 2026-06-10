@@ -51,7 +51,10 @@ process.stdin.on('end', () => {
     playerId = p.playerId || '';
   } catch {}
 
+  let done = false;
   const output = (connected) => {
+    if (done) return;
+    done = true;
     if (connected) {
       process.stdout.write(display > 0
         ? `\u{1F525} TokenSyber: ${display.toLocaleString('en-US')} tokens`
@@ -85,6 +88,6 @@ process.stdin.on('end', () => {
   req.on('error', () => output(false));
   req.on('timeout', () => {
     req.destroy();
-    output(false);
+    // destroy() triggers error event → output(false), no need to call twice
   });
 });
