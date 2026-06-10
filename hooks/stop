@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop hook: parse transcript JSONL, compute token delta, inject into game
+# Stop hook: parse transcript JSONL, compute token delta, inject into Worker
 
 set -euo pipefail
 
@@ -52,44 +52,26 @@ fi
 delta=$((total - prev))
 [ "$delta" -le 0 ] && exit 0
 
-# Discover TokenSyber server port
-# Fast path: read server.json for known port
-port=0
-STATE_DIR="$HOME/.tokensyber"
-SERVER_INFO_FILE="$STATE_DIR/server.json"
-if [ -f "$SERVER_INFO_FILE" ]; then
-  port=$(node -e "
-    try {
-      const info = JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));
-      if (info.port) process.stdout.write(String(info.port));
-      else process.stdout.write('0');
-    } catch { process.stdout.write('0'); }
-  " "$SERVER_INFO_FILE" 2>/dev/null || echo "0")
-fi
+# Read player credentials
+PLAYER_FILE="$HOME/.tokensyber/player.json"
+[ ! -f "$PLAYER_FILE" ] && exit 0
 
-# Fallback: scan ports 3001-3010, must have server=tokensyber
-if [ "$port" = "0" ]; then
-  for p in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
-    result=$(curl -s --connect-timeout 1 "http://127.0.0.1:${p}/fuel-port" 2>/dev/null || echo "")
-    if [ -n "$result" ]; then
-      port=$(printf '%s' "$result" | node -e "
-        let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
-          try{
-            const o=JSON.parse(d);
-            if(o.server==='tokensyber') process.stdout.write(String(o.port));
-            else process.stdout.write('0');
-          }catch{process.stdout.write('0')}
-        })
-      " 2>/dev/null || echo "0")
-      [ "$port" != "0" ] && break
-    fi
-  done
-fi
+PLAYER_ID=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).playerId)}catch{process.stdout.write('')}" "$PLAYER_FILE")
+HMAC_KEY=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).hmacKey)}catch{process.stdout.write('')}" "$PLAYER_FILE")
 
-[ "$port" = "0" ] && exit 0
+[ -z "$PLAYER_ID" ] && exit 0
 
-# Inject tokens
-inject_result=$(curl -s --connect-timeout 2 "http://127.0.0.1:${port}/fuel-inject?tokens=${delta}" 2>/dev/null || echo "")
+# Compute HMAC signature: HMAC-SHA256(hmacKey, "playerId:delta")
+SIG=$(node -e "
+const crypto = require('crypto');
+const key = process.argv[1];
+const msg = process.argv[2];
+process.stdout.write(crypto.createHmac('sha256', key).update(msg).digest('hex'));
+" "$HMAC_KEY" "${PLAYER_ID}:${delta}")
+
+# Inject tokens via Worker
+WORKER_URL="https://tokensyber-api.823009758.workers.dev"
+inject_result=$(curl -s --connect-timeout 3 "${WORKER_URL}/fuel-inject?player=${PLAYER_ID}&tokens=${delta}&sig=${SIG}" 2>/dev/null || echo "")
 
 # Check if game client was connected during injection
 clients=0
@@ -102,7 +84,6 @@ if [ -n "$inject_result" ]; then
 fi
 
 # Update state
-# Only accumulate injectedTokens when a game client was connected
 mkdir -p "$HOME/.tokensyber"
 node -e "
 const fs=require('fs');

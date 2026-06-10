@@ -1,11 +1,3 @@
 #!/usr/bin/env bash
-# SessionEnd hook: stop WS server
-
-PID_FILE="$HOME/.tokensyber/server.pid"
-SERVER_INFO_FILE="$HOME/.tokensyber/server.json"
-if [ -f "$PID_FILE" ]; then
-  pid=$(cat "$PID_FILE")
-  kill "$pid" 2>/dev/null || true
-  rm -f "$PID_FILE"
-fi
-rm -f "$SERVER_INFO_FILE"
+# SessionEnd hook: no local server to stop, just mark session end
+# (Worker handles connection lifecycle independently)

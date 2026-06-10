@@ -1,17 +1,16 @@
-// TokenSyber statusline: show tokens actually injected into the game for this context.
-// Reads injectedTokens from state.json + computes pending delta from live transcript.
-// Queries server /fuel-stats to check if game client is connected.
-// Reads server.json for fast port discovery (avoids unreliable port scanning).
+// TokenSyber statusline: show tokens injected + pending delta + Worker connection status.
+// Reads player.json for player ID, queries Worker /fuel-stats for connection status.
 
 let buf = '';
 process.stdin.on('data', c => buf += c);
 process.stdin.on('end', () => {
   const fs = require('fs');
   const path = require('path');
-  const http = require('http');
+  const https = require('https');
   const home = require('os').homedir();
+
   const stateFile = path.join(home, '.tokensyber', 'state.json');
-  const serverInfoFile = path.join(home, '.tokensyber', 'server.json');
+  const playerFile = path.join(home, '.tokensyber', 'player.json');
 
   // Read state.json for injectedTokens + lastTokens
   let injected = 0, lastTokens = 0;
@@ -21,7 +20,7 @@ process.stdin.on('end', () => {
     lastTokens = s.lastTokens || 0;
   } catch {}
 
-  // Compute pending delta from live transcript (tokens not yet injected by stop hook)
+  // Compute pending delta from live transcript
   let pending = 0;
   try {
     const input = JSON.parse(buf || '{}');
@@ -45,49 +44,12 @@ process.stdin.on('end', () => {
 
   const display = injected + pending;
 
-  // Try reading server.json for fast port discovery (no HTTP scanning needed)
-  let knownPort = null;
+  // Read player.json for player ID
+  let playerId = '';
   try {
-    const info = JSON.parse(fs.readFileSync(serverInfoFile, 'utf8'));
-    if (typeof info.port === 'number' && info.port >= 3001 && info.port <= 3010) {
-      // Verify the PID is still alive (stale server.json check)
-      let pidAlive = false;
-      try {
-        process.kill(info.pid, 0);
-        pidAlive = true;
-      } catch {}
-      if (pidAlive) {
-        knownPort = info.port;
-      } else {
-        // Stale file, clean it up
-        try { fs.unlinkSync(serverInfoFile); } catch {}
-      }
-    }
+    const p = JSON.parse(fs.readFileSync(playerFile, 'utf8'));
+    playerId = p.playerId || '';
   } catch {}
-
-  // Query /fuel-stats on a specific port, return {connected, clients}
-  const queryStats = (port, callback) => {
-    const req = http.get(`http://127.0.0.1:${port}/fuel-stats`, { timeout: 1500 }, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        let connected = false;
-        try {
-          const data = JSON.parse(body);
-          // Verify this is actually the tokensyber server
-          if (data.port !== undefined && data.totalTokens !== undefined) {
-            connected = data.clients > 0;
-          }
-        } catch {}
-        callback(connected);
-      });
-    });
-    req.on('error', () => callback(null)); // null = couldn't reach, try next
-    req.on('timeout', () => {
-      req.destroy();
-      callback(null);
-    });
-  };
 
   const output = (connected) => {
     if (connected) {
@@ -95,74 +57,34 @@ process.stdin.on('end', () => {
         ? `\u{1F525} TokenSyber: ${display.toLocaleString('en-US')} tokens`
         : '\u{1F525} TokenSyber: 等待对话');
     } else {
-      process.stdout.write('\u{1F4A8} TokenSyber: 未连接 · 发起对话刷新');
+      process.stdout.write(playerId
+        ? '\u{1F4A8} TokenSyber: 未连接 · 发起对话刷新'
+        : '\u{1F4A8} TokenSyber: 未配置');
     }
   };
 
-  // Strategy: known port first (instant), then scan fallback
-  if (knownPort !== null) {
-    queryStats(knownPort, (connected) => {
-      if (connected !== null) {
-        output(connected);
-      } else {
-        // Server.json pointed to a dead port, fall back to scan
-        scanPorts(3001, output);
-      }
-    });
-  } else {
-    scanPorts(3001, output);
+  if (!playerId) {
+    output(false);
+    return;
   }
 
-  function scanPorts(port, done) {
-    if (port > 3010) {
-      done(false);
-      return;
-    }
-    queryStats(port, (connected) => {
-      if (connected !== null) {
-        // Got a response from this port (tokensyber or not)
-        // If it's tokensyber (verified by queryStats), use the result
-        // If not tokensyber, connected would be false, try next port
-        if (connected === true) {
-          done(true);
-        } else {
-          // connected is false (tokensyber found but no clients) or null was already handled
-          // Need to check: did we actually reach tokensyber?
-          // queryStats returns null for unreachable, false for "reached but no clients"
-          // We can't distinguish "reached non-tokensyber" from "reached tokensyber with 0 clients"
-          // Let's verify with /fuel-port to check if this is actually our server
-          verifyAndContinue(port, done);
-        }
-      } else {
-        // Couldn't reach this port, try next
-        scanPorts(port + 1, done);
-      }
+  // Query Worker for connection status
+  const WORKER_URL = `https://tokensyber-api.823009758.workers.dev/fuel-stats?player=${playerId}`;
+  const req = https.get(WORKER_URL, { timeout: 2000 }, (res) => {
+    let body = '';
+    res.on('data', c => body += c);
+    res.on('end', () => {
+      let connected = false;
+      try {
+        const data = JSON.parse(body);
+        connected = data.connected === true;
+      } catch {}
+      output(connected);
     });
-  }
-
-  function verifyAndContinue(port, done) {
-    const req = http.get(`http://127.0.0.1:${port}/fuel-port`, { timeout: 1000 }, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        let isTokenSyber = false;
-        try {
-          const data = JSON.parse(body);
-          isTokenSyber = data.server === 'tokensyber';
-        } catch {}
-        if (isTokenSyber) {
-          // This IS our server, just no clients connected
-          done(false);
-        } else {
-          // Not our server, continue scanning
-          scanPorts(port + 1, done);
-        }
-      });
-    });
-    req.on('error', () => scanPorts(port + 1, done));
-    req.on('timeout', () => {
-      req.destroy();
-      scanPorts(port + 1, done);
-    });
-  }
+  });
+  req.on('error', () => output(false));
+  req.on('timeout', () => {
+    req.destroy();
+    output(false);
+  });
 });
