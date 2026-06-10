@@ -1,0 +1,11 @@
+{
+  "name": "tokensyber",
+  "description": "AI token consumption drives 3D printing — your compute power is fuel",
+  "version": "0.1.0",
+  "author": {
+    "name": "TokenSyber"
+  },
+  "homepage": "https://tokensyber.com",
+  "license": "MIT",
+  "keywords": ["tokens", "ai", "game", "fuel"]
+}

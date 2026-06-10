@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Stop hook: parse transcript JSONL, compute token delta, inject into game
+
+set -euo pipefail
+
+# Read stdin JSON and extract transcript_path
+input=$(cat)
+transcript_path=$(printf '%s' "$input" | node -e "
+  let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
+    try{const o=JSON.parse(d); process.stdout.write(o.transcript_path||'')}catch{process.stdout.write('')}
+  })
+")
+
+[ -z "$transcript_path" ] && exit 0
+[ ! -f "$transcript_path" ] && exit 0
+
+# Parse JSONL, sum all assistant message token usage
+total=$(node -e "
+const fs=require('fs');
+let total=0;
+try{
+  const lines=fs.readFileSync(process.argv[1],'utf8').split('\n');
+  for(const line of lines){
+    if(!line.trim())continue;
+    try{
+      const o=JSON.parse(line);
+      if(o.type==='assistant'){
+        const u=(o.message&&o.message.usage)||{};
+        total+=(u.input_tokens||0)+(u.output_tokens||0);
+      }
+    }catch{}
+  }
+}catch{}
+process.stdout.write(String(total));
+" "$transcript_path")
+
+[ -z "$total" ] && exit 0
+[ "$total" -eq 0 ] && exit 0
+
+# Read previous state
+STATE_FILE="$HOME/.tokensyber/state.json"
+prev=0
+last_transcript=""
+if [ -f "$STATE_FILE" ]; then
+  prev=$(node -e "try{process.stdout.write(String(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).lastTokens||0))}catch{process.stdout.write('0')}" "$STATE_FILE")
+  last_transcript=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).lastTranscript||'')}catch{process.stdout.write('')}" "$STATE_FILE")
+fi
+
+# New session: reset prev
+[ "$transcript_path" != "$last_transcript" ] && prev=0
+
+delta=$((total - prev))
+[ "$delta" -le 0 ] && exit 0
+
+# Discover TokenSyber server port
+# Fast path: read server.json for known port
+port=0
+STATE_DIR="$HOME/.tokensyber"
+SERVER_INFO_FILE="$STATE_DIR/server.json"
+if [ -f "$SERVER_INFO_FILE" ]; then
+  port=$(node -e "
+    try {
+      const info = JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));
+      if (info.port) process.stdout.write(String(info.port));
+      else process.stdout.write('0');
+    } catch { process.stdout.write('0'); }
+  " "$SERVER_INFO_FILE" 2>/dev/null || echo "0")
+fi
+
+# Fallback: scan ports 3001-3010, must have server=tokensyber
+if [ "$port" = "0" ]; then
+  for p in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
+    result=$(curl -s --connect-timeout 1 "http://127.0.0.1:${p}/fuel-port" 2>/dev/null || echo "")
+    if [ -n "$result" ]; then
+      port=$(printf '%s' "$result" | node -e "
+        let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+          try{
+            const o=JSON.parse(d);
+            if(o.server==='tokensyber') process.stdout.write(String(o.port));
+            else process.stdout.write('0');
+          }catch{process.stdout.write('0')}
+        })
+      " 2>/dev/null || echo "0")
+      [ "$port" != "0" ] && break
+    fi
+  done
+fi
+
+[ "$port" = "0" ] && exit 0
+
+# Inject tokens
+inject_result=$(curl -s --connect-timeout 2 "http://127.0.0.1:${port}/fuel-inject?tokens=${delta}" 2>/dev/null || echo "")
+
+# Check if game client was connected during injection
+clients=0
+if [ -n "$inject_result" ]; then
+  clients=$(printf '%s' "$inject_result" | node -e "
+    let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+      try{process.stdout.write(String(JSON.parse(d).clients||0))}catch{process.stdout.write('0')}
+    })
+  " 2>/dev/null || echo "0")
+fi
+
+# Update state
+# Only accumulate injectedTokens when a game client was connected
+mkdir -p "$HOME/.tokensyber"
+node -e "
+const fs=require('fs');
+const f=process.argv[1];
+const delta=${delta};
+const clients=${clients:-0};
+let s={};
+try{s=JSON.parse(fs.readFileSync(f,'utf8'))}catch{}
+s.lastTokens=${total};
+s.injectedTokens=(s.injectedTokens||0)+(clients>0?delta:0);
+s.lastTranscript=process.argv[2];
+fs.writeFileSync(f,JSON.stringify(s));
+" "$STATE_FILE" "$transcript_path"

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# SessionStart hook: start WS server if not already running
+
+set -euo pipefail
+
+STATE_DIR="$HOME/.tokensyber"
+PID_FILE="$STATE_DIR/server.pid"
+SERVER_INFO_FILE="$STATE_DIR/server.json"
+mkdir -p "$STATE_DIR"
+
+# Clear cached token count so statusline fallback shows 0 for new context
+echo '{"lastTokens":0,"injectedTokens":0}' > "$STATE_DIR/state.json"
+
+# Check existing instance via server.json (has port info for fast check)
+if [ -f "$SERVER_INFO_FILE" ]; then
+  port=$(node -e "
+    try {
+      const info = JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));
+      if (info.port && info.pid) {
+        try { process.kill(info.pid, 0); process.stdout.write(String(info.port)); } catch { process.stdout.write('0'); }
+      } else { process.stdout.write('0'); }
+    } catch { process.stdout.write('0'); }
+  " "$SERVER_INFO_FILE" 2>/dev/null || echo "0")
+  if [ "$port" != "0" ]; then
+    # Verify server is actually responsive
+    if curl -s --connect-timeout 1 "http://127.0.0.1:${port}/fuel-port" > /dev/null 2>&1; then
+      exit 0
+    fi
+  fi
+  # Stale info file, clean up
+  rm -f "$SERVER_INFO_FILE"
+fi
+
+# Fallback: check PID file
+if [ -f "$PID_FILE" ]; then
+  old_pid=$(cat "$PID_FILE")
+  if kill -0 "$old_pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$PID_FILE"
+fi
+
+# Quick port check on default port
+if curl -s --connect-timeout 1 "http://127.0.0.1:3001/fuel-port" > /dev/null 2>&1; then
+  exit 0
+fi
+
+# Determine plugin root
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Start server in background
+nohup node "${PLUGIN_ROOT}/server/server.cjs" > "$STATE_DIR/server.log" 2>&1 &
+SERVER_PID=$!
+disown "$SERVER_PID" 2>/dev/null
+echo "$SERVER_PID" > "$PID_FILE"
+
+# Wait for server to be ready (up to 5s)
+for i in $(seq 1 50); do
+  if [ -f "$SERVER_INFO_FILE" ]; then
+    exit 0
+  fi
+  # Also check via HTTP as fallback
+  if curl -s --connect-timeout 1 "http://127.0.0.1:3001/fuel-port" > /dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 0.1
+done
+
+exit 0
