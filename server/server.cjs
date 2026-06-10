@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
@@ -75,6 +76,7 @@ function decodeFrame(buffer) {
 
 const DEFAULT_PORT = 3001;
 const MAX_PORT = 3010;
+const HTTPS_PORT_OFFSET = 10;  // HTTPS on 3011-3020
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
@@ -82,19 +84,20 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age': '86400',
 };
 
-const PID_FILE = path.join(
+const STATE_DIR = path.join(
   process.env.HOME || process.env.USERPROFILE || '~',
-  '.tokensyber', 'server.pid'
+  '.tokensyber'
 );
 
-const SERVER_INFO_FILE = path.join(
-  process.env.HOME || process.env.USERPROFILE || '~',
-  '.tokensyber', 'server.json'
-);
+const PID_FILE = path.join(STATE_DIR, 'server.pid');
+const SERVER_INFO_FILE = path.join(STATE_DIR, 'server.json');
+const CERT_FILE = path.join(STATE_DIR, 'server-cert.pem');
+const KEY_FILE = path.join(STATE_DIR, 'server-key.pem');
 
 let totalTokens = 0;
 let totalRequests = 0;
 let actualPort = null;
+let actualHttpsPort = null;
 
 // ========== WebSocket Clients ==========
 
@@ -134,7 +137,7 @@ function handleRequest(req, res) {
 
   if (req.url === '/fuel-port') {
     res.writeHead(200, headers);
-    res.end(JSON.stringify({ port: actualPort, server: 'tokensyber' }));
+    res.end(JSON.stringify({ port: actualPort, httpsPort: actualHttpsPort, server: 'tokensyber' }));
     return;
   }
 
@@ -145,6 +148,7 @@ function handleRequest(req, res) {
       totalRequests,
       clients: clients.size,
       port: actualPort,
+      httpsPort: actualHttpsPort,
     }));
     return;
   }
@@ -249,10 +253,10 @@ function tryPort(port) {
     process.exit(1);
   }
 
-  const server = http.createServer(handleRequest);
-  server.on('upgrade', handleUpgrade);
+  const httpServer = http.createServer(handleRequest);
+  httpServer.on('upgrade', handleUpgrade);
 
-  server.on('error', (err) => {
+  httpServer.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       tryPort(port + 1);
     } else {
@@ -261,9 +265,10 @@ function tryPort(port) {
     }
   });
 
-  server.listen(port, '0.0.0.0', () => {
+  httpServer.listen(port, '0.0.0.0', () => {
     actualPort = port;
-    console.log(JSON.stringify({ type: 'server-started', port }));
+    const httpsPort = port + HTTPS_PORT_OFFSET;
+    console.log(JSON.stringify({ type: 'server-started', port, httpsPort }));
 
     // Write PID file and server info file
     const dir = path.dirname(PID_FILE);
@@ -271,9 +276,13 @@ function tryPort(port) {
     fs.writeFileSync(PID_FILE, String(process.pid));
     fs.writeFileSync(SERVER_INFO_FILE, JSON.stringify({
       port,
+      httpsPort,
       pid: process.pid,
       startedAt: Date.now(),
     }));
+
+    // Start HTTPS server if cert exists
+    startHttpsServer(httpsPort);
 
     // Server-side heartbeat
     const heartbeat = setInterval(() => {
@@ -297,10 +306,47 @@ function tryPort(port) {
       for (const socket of clients) {
         try { socket.end(encodeFrame(OPCODES.CLOSE, Buffer.alloc(0))); } catch { /* ignore */ }
       }
-      server.close(() => process.exit(0));
+      httpServer.close(() => process.exit(0));
     }
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
+  });
+}
+
+function startHttpsServer(httpsPort) {
+  // Read cert files
+  let tlsOptions;
+  try {
+    tlsOptions = {
+      key: fs.readFileSync(KEY_FILE),
+      cert: fs.readFileSync(CERT_FILE),
+    };
+  } catch (e) {
+    console.warn(JSON.stringify({ type: 'https-skipped', reason: 'No cert files found. WSS not available.' }));
+    return;
+  }
+
+  const httpsServer = https.createServer(tlsOptions, handleRequest);
+  httpsServer.on('upgrade', handleUpgrade);
+
+  httpsServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(JSON.stringify({ type: 'https-port-in-use', port: httpsPort }));
+    } else {
+      console.warn(JSON.stringify({ type: 'https-error', error: err.message }));
+    }
+    // HTTPS is optional — don't exit, just skip
+  });
+
+  httpsServer.listen(httpsPort, '0.0.0.0', () => {
+    actualHttpsPort = httpsPort;
+    console.log(JSON.stringify({ type: 'https-started', port: httpsPort }));
+    // Update server info with HTTPS port
+    try {
+      const info = JSON.parse(fs.readFileSync(SERVER_INFO_FILE, 'utf8'));
+      info.httpsPort = httpsPort;
+      fs.writeFileSync(SERVER_INFO_FILE, JSON.stringify(info));
+    } catch { /* ignore */ }
   });
 }
 

@@ -6,10 +6,23 @@ set -euo pipefail
 STATE_DIR="$HOME/.tokensyber"
 PID_FILE="$STATE_DIR/server.pid"
 SERVER_INFO_FILE="$STATE_DIR/server.json"
+CERT_FILE="$STATE_DIR/server-cert.pem"
+KEY_FILE="$STATE_DIR/server-key.pem"
 mkdir -p "$STATE_DIR"
 
 # Clear cached token count so statusline fallback shows 0 for new context
 echo '{"lastTokens":0,"injectedTokens":0}' > "$STATE_DIR/state.json"
+
+# Generate self-signed cert for WSS (if not exists or expired)
+if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+  openssl req -x509 -newkey rsa:2048 \
+    -keyout "$KEY_FILE" \
+    -out "$CERT_FILE" \
+    -days 3650 -nodes \
+    -subj '/CN=TokenSyber Local' \
+    -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' \
+    2>/dev/null || true
+fi
 
 # Check existing instance via server.json (has port info for fast check)
 if [ -f "$SERVER_INFO_FILE" ]; then
