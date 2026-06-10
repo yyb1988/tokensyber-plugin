@@ -69,7 +69,7 @@ process.stdin.on('end', () => {
   }
 
   // Query Worker for connection status
-  const WORKER_URL = `https://tokensyber-api.823009758.workers.dev/fuel-stats?player=${playerId}`;
+  const WORKER_URL = `https://tokensyber.pages.dev/fuel-stats?player=${playerId}`;
   const req = https.get(WORKER_URL, { timeout: 2000 }, (res) => {
     let body = '';
     res.on('data', c => body += c);

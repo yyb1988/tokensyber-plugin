@@ -70,7 +70,7 @@ process.stdout.write(crypto.createHmac('sha256', key).update(msg).digest('hex'))
 " "$HMAC_KEY" "${PLAYER_ID}:${delta}")
 
 # Inject tokens via Worker
-WORKER_URL="https://tokensyber-api.823009758.workers.dev"
+WORKER_URL="https://tokensyber.pages.dev"
 inject_result=$(curl -s --connect-timeout 3 "${WORKER_URL}/fuel-inject?player=${PLAYER_ID}&tokens=${delta}&sig=${SIG}" 2>/dev/null || echo "")
 
 # Check if game client was connected during injection
