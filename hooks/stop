@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Stop hook: parse transcript JSONL, compute token delta, inject into Worker
+# Protocol v2: sends cumulative total + nonce + timestamp, server computes delta
 
 set -euo pipefail
 
@@ -37,20 +38,20 @@ process.stdout.write(String(total));
 [ -z "$total" ] && exit 0
 [ "$total" -eq 0 ] && exit 0
 
-# Read previous state
+# Read previous state (used only for local display, not for delta calculation)
 STATE_FILE="$HOME/.tokensyber/state.json"
-prev=0
 last_transcript=""
+prev=0
 if [ -f "$STATE_FILE" ]; then
   prev=$(node -e "try{process.stdout.write(String(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).lastTokens||0))}catch{process.stdout.write('0')}" "$STATE_FILE")
   last_transcript=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).lastTranscript||'')}catch{process.stdout.write('')}" "$STATE_FILE")
 fi
 
-# New session: reset prev
+# New session: reset local prev
 [ "$transcript_path" != "$last_transcript" ] && prev=0
 
-delta=$((total - prev))
-[ "$delta" -le 0 ] && exit 0
+local_delta=$((total - prev))
+# Server will compute actual delta from its stored lastReportedTotal
 
 # Read player credentials
 PLAYER_FILE="$HOME/.tokensyber/player.json"
@@ -60,38 +61,56 @@ PLAYER_ID=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileS
 HMAC_KEY=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).hmacKey)}catch{process.stdout.write('')}" "$PLAYER_FILE")
 
 [ -z "$PLAYER_ID" ] && exit 0
+[ -z "$HMAC_KEY" ] && exit 0
 
-# Compute HMAC signature: HMAC-SHA256(hmacKey, "playerId:delta")
+# Generate nonce + timestamp for anti-replay
+NONCE_TS=$(node -e "
+const crypto = require('crypto');
+const nonce = crypto.randomBytes(16).toString('hex');
+const ts = Date.now();
+process.stdout.write(nonce + ' ' + String(ts));
+")
+NONCE=$(echo "$NONCE_TS" | cut -d' ' -f1)
+TS=$(echo "$NONCE_TS" | cut -d' ' -f2)
+
+# Compute HMAC signature: HMAC-SHA256(key, "playerId:total:nonce:ts")
 SIG=$(node -e "
 const crypto = require('crypto');
 const key = process.argv[1];
 const msg = process.argv[2];
 process.stdout.write(crypto.createHmac('sha256', key).update(msg).digest('hex'));
-" "$HMAC_KEY" "${PLAYER_ID}:${delta}")
+" "$HMAC_KEY" "${PLAYER_ID}:${total}:${NONCE}:${TS}")
 
-# Inject tokens via Worker (retry once on failure for cold starts)
+# Protocol v2: send total (cumulative) + nonce + ts, server computes delta
 WORKER_URL="https://tokensyber.pages.dev"
+
 inject_result=""
 for attempt in 1 2; do
-  inject_result=$(curl -s --connect-timeout 10 --max-time 15 "${WORKER_URL}/fuel-inject?player=${PLAYER_ID}&tokens=${delta}&sig=${SIG}" 2>/dev/null || echo "")
+  inject_result=$(curl -s --connect-timeout 10 --max-time 15 \
+    "${WORKER_URL}/fuel-inject?player=${PLAYER_ID}&total=${total}&nonce=${NONCE}&ts=${TS}&sig=${SIG}" \
+    2>/dev/null || echo "")
   if [ -n "$inject_result" ]; then
-    if printf '%s' "$inject_result" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);if(o.ok||o.error)process.stdout.write('ok')}catch{process.stdout.write('0')}})" 2>/dev/null | grep -q ok; then
+    if printf '%s' "$inject_result" | node -e "
+      let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+        try{const o=JSON.parse(d);if(o.ok||o.error)process.stdout.write('ok')}catch{process.stdout.write('0')}
+      })
+    " 2>/dev/null | grep -q ok; then
       break
     fi
   fi
   [ "$attempt" = "1" ] && sleep 1
 done
 
-# Update state
+# Update local state (for statusline display only; server is the authority)
 mkdir -p "$HOME/.tokensyber"
 node -e "
 const fs=require('fs');
 const f=process.argv[1];
-const delta=${delta};
+const total=${total};
 let s={};
 try{s=JSON.parse(fs.readFileSync(f,'utf8'))}catch{}
-s.lastTokens=${total};
-s.injectedTokens=(s.injectedTokens||0)+delta;
+s.lastTokens=total;
+s.injectedTokens=(s.injectedTokens||0)+${local_delta};
 s.lastTranscript=process.argv[2];
 fs.writeFileSync(f,JSON.stringify(s));
 " "$STATE_FILE" "$transcript_path"
