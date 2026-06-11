@@ -69,19 +69,18 @@ const msg = process.argv[2];
 process.stdout.write(crypto.createHmac('sha256', key).update(msg).digest('hex'));
 " "$HMAC_KEY" "${PLAYER_ID}:${delta}")
 
-# Inject tokens via Worker
+# Inject tokens via Worker (retry once on failure for cold starts)
 WORKER_URL="https://tokensyber.pages.dev"
-inject_result=$(curl -s --connect-timeout 3 "${WORKER_URL}/fuel-inject?player=${PLAYER_ID}&tokens=${delta}&sig=${SIG}" 2>/dev/null || echo "")
-
-# Check if game client was connected during injection
-clients=0
-if [ -n "$inject_result" ]; then
-  clients=$(printf '%s' "$inject_result" | node -e "
-    let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
-      try{process.stdout.write(String(JSON.parse(d).clients||0))}catch{process.stdout.write('0')}
-    })
-  " 2>/dev/null || echo "0")
-fi
+inject_result=""
+for attempt in 1 2; do
+  inject_result=$(curl -s --connect-timeout 10 --max-time 15 "${WORKER_URL}/fuel-inject?player=${PLAYER_ID}&tokens=${delta}&sig=${SIG}" 2>/dev/null || echo "")
+  if [ -n "$inject_result" ]; then
+    if printf '%s' "$inject_result" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);if(o.ok||o.error)process.stdout.write('ok')}catch{process.stdout.write('0')}})" 2>/dev/null | grep -q ok; then
+      break
+    fi
+  fi
+  [ "$attempt" = "1" ] && sleep 1
+done
 
 # Update state
 mkdir -p "$HOME/.tokensyber"
@@ -89,11 +88,10 @@ node -e "
 const fs=require('fs');
 const f=process.argv[1];
 const delta=${delta};
-const clients=${clients:-0};
 let s={};
 try{s=JSON.parse(fs.readFileSync(f,'utf8'))}catch{}
 s.lastTokens=${total};
-s.injectedTokens=(s.injectedTokens||0)+(clients>0?delta:0);
+s.injectedTokens=(s.injectedTokens||0)+delta;
 s.lastTranscript=process.argv[2];
 fs.writeFileSync(f,JSON.stringify(s));
 " "$STATE_FILE" "$transcript_path"
